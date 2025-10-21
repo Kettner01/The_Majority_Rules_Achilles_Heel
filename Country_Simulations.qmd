@@ -1,0 +1,1329 @@
+---
+title: "CSES Model3"
+date: 10/13/2025
+date-format: "MMMM D, YYYY"
+author: "Lucas Brandt Kettner"
+geometry: a4paper
+toc: true                     # This will generate a TOC with default settings (all headings)
+depth: 3                      # Include up to three levels of headings in the TOC
+ordered: true                 # Use ordered (numbered) list for the TOC
+location: right               # Position the TOC
+urlcolor: blue
+format:
+  html:
+    embed-resources: true     # Embeds all resources (images, CSS, JS) into a single HTML
+    html-math-method: mathml  # Use mathml or MathJax to render LaTeX equations in HTML
+    toc: true                 # Ensure TOC is enabled for HTML output
+---
+
+
+# Data & Packages
+```{r}
+# ---- Load data & libs ----
+load("cses5.rdata")
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggrepel)
+library(stringr)
+library(patchwork)
+library(RColorBrewer)
+source("Party_dictionary_CSES_5.R")
+source("Voting_rules.R")
+```
+
+
+# Code
+
+
+## Voters & Parties histogram plotter
+```{r}
+plot_voters_and_parties <- function(country, year, letters, party_names, palette_named,
+                                    binwidth = 1, title_prefix = country) {
+  # 1) Voters' self-placement (E3020) on 0–10
+  x <- subset(cses5, E1006_NAM == country & E1008 == year)$E3020
+  x <- x[!is.na(x) & x >= 0 & x <= 10]
+  if (!length(x)) stop("No valid E3020 for ", country, " ", year)
+
+  # Precompute density-as-rectangles for clean bin edges (0–1, 1–2, … 9–10)
+  edges <- seq(0, 10, by = binwidth)
+  bin_index <- findInterval(x, edges, rightmost.closed = TRUE, all.inside = TRUE)
+  bin_index[bin_index == length(edges)] <- length(edges) - 1
+  counts <- tabulate(bin_index, nbins = length(edges) - 1)
+  N <- sum(counts)
+  df_hist <- data.frame(
+    xmin = head(edges, -1),
+    xmax = tail(edges, -1),
+    ymax = if (N > 0) counts / (N * binwidth) else 0
+  )
+  ylim_top <- max(0.25, max(df_hist$ymax, na.rm = TRUE) * 1.05)
+
+  # 2) Expert party positions (E5018_*), stay on 0–10; take first non-missing
+  df <- subset(cses5, E1006_NAM == country & E1008 == year)
+  evars <- paste0("E5018_", letters)
+  expert_vals <- df |>
+    dplyr::summarise(dplyr::across(all_of(evars), ~ suppressWarnings(na.omit(.))[1])) |>
+    tidyr::pivot_longer(dplyr::everything(), names_to = "var", values_to = "score") |>
+    dplyr::mutate(letter = sub("E5018_", "", var)) |>
+    dplyr::select(letter, score)
+
+  party_df <- tibble::tibble(letter = letters, party = factor(party_names, levels = party_names)) |>
+    dplyr::left_join(expert_vals, by = "letter") |>
+    dplyr::filter(!is.na(score)) |>
+    dplyr::mutate(x_mid = pmin(9.5, floor(score) + 0.5))   # anchor labels to bin centers
+
+  # 3) Colors aligned to party names you pass
+  pal <- palette_named[as.character(levels(party_df$party))]
+
+  # 4) Plot
+  ggplot() +
+    # voter distribution (density by 1-wide bins)
+    geom_rect(data = df_hist,
+              aes(xmin = xmin, xmax = xmax, ymin = 0, ymax = ymax),
+              fill = "ivory", color = "black", linewidth = 0.4) +
+    # party points on baseline
+    geom_point(data = party_df, aes(x = x_mid, y = 0, color = party), size = 2) +
+    # party labels with short wraps
+    ggrepel::geom_text_repel(
+      data = party_df,
+      aes(x = x_mid, y = 0, label = stringr::str_wrap(as.character(party), 22),
+          color = party),
+      direction = "both",
+      nudge_y = 0.25, xlim = c(0, 10.8),
+      box.padding = 0.6, point.padding = 0.1,
+      force = 5, force_pull = 0.2,
+      max.overlaps = Inf, min.segment.length = 0,
+      segment.size = 0.25, segment.curvature = 0.1,
+      segment.angle = 20, segment.ncp = 4,
+      seed = 42
+    ) +
+    scale_color_manual(values = pal, guide = "none") +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.25))) +
+    coord_cartesian(xlim = c(0, 10.8), ylim = c(-0.06, ylim_top), clip = "off") +
+    scale_x_continuous(breaks = seq(0.5, 9.5, by = 1), labels = 1:10) +
+    labs(
+      title = paste0(title_prefix, " ", year, ": Voter Self-Placement (E3020) and Party Positions (E5018)"),
+      x = "Position on 0–10 Left–Right Scale",
+      y = "Density"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0, face = "bold"),
+      panel.grid.minor = element_blank(),
+      axis.title.y = element_text(margin = margin(r = 8))
+    )
+}
+
+# --- Plot a correlation heatmap for rule rankings ---
+plot_corr_heatmap <- function(rank_mat, method = "kendall") {
+  tau <- cor(rank_mat, method = method, use = "pairwise.complete.obs")
+  df  <- as.data.frame(as.table(tau))
+  names(df) <- c("Rule1","Rule2","tau")
+
+  ggplot2::ggplot(df, ggplot2::aes(Rule1, Rule2, fill = tau)) +
+    ggplot2::geom_tile(color = "white") +
+    ggplot2::geom_text(ggplot2::aes(label = sprintf("%.2f", tau))) +
+    ggplot2::scale_fill_gradientn(
+      colours = RColorBrewer::brewer.pal(11, "BrBG"),
+      limits  = c(-1, 1)
+    ) +
+    ggplot2::coord_equal() +
+    ggplot2::labs(
+      title = paste0(toupper(substr(method,1,1)), substr(method,2,999),
+                     " Rank Correlation (rules vs. rules)"),
+      x = NULL, y = NULL, fill = "τ"
+    ) +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
+}
+```
+
+
+
+
+## Scoring intervals
+
+```{r}
+plot_scoring_intervals <- function(breaks, mirror = FALSE, title = "Scoring Intervals on [0,1]") {
+  df <- data.frame(
+    xmin  = breaks[-length(breaks)],
+    xmax  = breaks[-1],
+    score = 10:0
+  )
+  if (mirror) {
+    df <- transform(df, xmin = 1 - xmax, xmax = 1 - xmin)
+  }
+  ggplot(df) +
+    geom_rect(aes(xmin = xmin, xmax = xmax,
+                  ymin = score - 0.4, ymax = score + 0.4),
+              fill = "beige", color = "black") +
+    scale_x_continuous(expand = c(0, 0)) +
+    scale_y_continuous(limits = c(-1, 11), breaks = 0:10) +
+    labs(x = if (mirror) "1 - Distance" else "Distance",
+         y = "Score", title = if (mirror) paste0(title, ' (mirrored)') else title ) +
+    theme_minimal()
+}
+
+```
+
+```{r}
+# 1) Scoring-intervals plot
+breaks_linear <- c(0, 0.05, seq(0.15, 0.95, by = 0.10), 1.0)
+plot_scoring_intervals(breaks_linear)                       # Distance
+plot_scoring_intervals(breaks_linear, mirror = TRUE)
+```
+
+```{r}
+# 1) Scoring-intervals plot
+breaks_sigmo <- c(0, 0.02, 0.05, 0.10, 0.20, 0.40, 0.60, 0.80, 0.90, 0.95, 0.98, 1.0)
+plot_scoring_intervals(breaks_sigmo)                       # Distance
+plot_scoring_intervals(breaks_sigmo, mirror = TRUE)
+```
+
+
+
+
+## Analysis functions
+
+```{r}
+analyze_synthetic <- function(utilities,
+                              rules       = c("borda","plurality","approval2","mean_winner"),
+                              selectivity = 1,
+                              scaled      = TRUE,
+                              ordered     = TRUE,
+                              w           = 0.8,
+                              palette     = NULL,
+                              scheme_params = list(),
+                              quiet = FALSE) {
+
+  utilities <- as.matrix(utilities)
+  alt_names <- colnames(utilities)
+
+  pal_aligned <- if (is.null(palette)) {
+    setNames(rep_len("#377EB8", length(alt_names)), alt_names)
+  } else {
+    nm <- alt_names; pal <- palette[nm]; pal[is.na(pal)] <- "#BBBBBB"; setNames(unname(pal), nm)
+  }
+
+  if (!is.null(palette) && !quiet) {
+    df <- as.data.frame(utilities) |>
+      dplyr::mutate(agent = dplyr::row_number()) |>
+      tidyr::pivot_longer(-agent, names_to = "Alt", values_to = "Utility") |>
+      dplyr::mutate(Utility = factor(as.integer(round(Utility)), levels = 0:10, ordered = TRUE))
+    pal_hist <- pal_aligned[levels(factor(df$Alt))]
+    print(ggplot2::ggplot(df, ggplot2::aes(Utility, fill = Alt)) +
+            ggplot2::geom_bar(width = 0.8, color = "black", alpha = 0.85) +
+            ggplot2::facet_wrap(~ Alt, scales = "free_y",
+                                 labeller = ggplot2::label_wrap_gen(width = 20)) +
+            ggplot2::scale_fill_manual(values = pal_hist) +
+            ggplot2::labs(title = "Histogram of Utilities by Alternative", x = "Utility", y = "Count") +
+            ggplot2::theme_minimal() + ggplot2::theme(legend.position = "none",
+                                                       strip.text = ggplot2::element_text(face = "bold")))
+  }
+
+  rule_plots <- list()
+  rank_list  <- list()
+
+  for (rule in rules) {
+    
+    get_scores <- function(res, alt_names) {
+      if (is.list(res) && !is.null(res$scores)) {
+        s <- res$scores
+      } else {
+        s <- colSums(res)
+      }
+      names(s) <- alt_names
+      s
+    }
+    
+    # fetch params for this rule-alias (if any)
+params <- scheme_params[[rule]]
+if (is.null(params)) params <- list()
+
+# allow aliases: if params$scheme is provided, call that base rule instead of the alias
+base_scheme <- if (!is.null(params$scheme)) { bs <- params$scheme; params$scheme <- NULL; bs } else rule
+
+# optional pretty label for plots/tables
+this_label <- params$label; params$label <- NULL
+
+res <- do.call(voting_strategy, c(list(utilities = utilities, scheme = base_scheme), params))
+scores <- get_scores(res, alt_names)
+
+# later, when you create the display name:
+pretty_name <- if (!is.null(this_label)) this_label else ifelse(rule %in% names(rule_map), rule_map[rule], rule)
+    
+    # robust scaling for plotting (keeps negative values meaningful)
+    if (scaled && all(is.finite(scores)) && all(scores >= 0) && sum(scores) > 0) {
+      totals_plot <- scores / sum(scores)
+    } else if (scaled && max(abs(scores), na.rm = TRUE) > 0) {
+      totals_plot <- scores / max(abs(scores), na.rm = TRUE)  # signed max scaling
+    } else {
+      totals_plot <- scores  # raw
+    }
+    
+    totals <- scores
+    df_raw  <- data.frame(alt = alt_names, votes = totals_plot, check.names = FALSE)
+    df_plot <- if (ordered) df_raw[order(df_raw$votes, decreasing = TRUE), ] else df_raw
+    df_plot$alt <- factor(df_plot$alt, levels = df_plot$alt)
+
+    if (!quiet) {
+      p <- ggplot2::ggplot(df_plot, ggplot2::aes(alt, votes, fill = alt)) +
+        ggplot2::geom_col(width = w) +
+        ggplot2::scale_fill_manual(values = pal_aligned[levels(df_plot$alt)]) +
+        ggplot2::scale_x_discrete(labels = function(x) stringr::str_wrap(x, width = 12)) +
+        ggplot2::labs(title = paste("Results:", pretty_name), x = NULL, y = if (scaled) "Proportion" else "Votes") +
+        ggplot2::theme_minimal() +
+        ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, vjust = 1, size = 8),
+                       legend.position = "none",
+                       plot.title = ggplot2::element_text(hjust = 0.5))
+      print(p); rule_plots[[length(rule_plots) + 1]] <- p
+    }
+
+    rvec <- rank(-totals, ties.method = "average"); names(rvec) <- alt_names
+    pretty_name <- ifelse(rule %in% names(rule_map), rule_map[rule], rule)
+    rank_list[[ pretty_name ]] <- rvec
+  }
+
+  if (length(rank_list) >= 2) {
+    rule_names <- names(rank_list)
+    rank_mat <- do.call(cbind, lapply(rank_list, function(v) v[alt_names]))
+    colnames(rank_mat) <- rule_names; rownames(rank_mat) <- alt_names
+
+    kendall  <- cor(rank_mat, method = "kendall",  use = "pairwise.complete.obs")
+    spearman <- cor(rank_mat, method = "spearman", use = "pairwise.complete.obs")
+
+    if (!quiet) {
+      suppressWarnings({
+        dfc <- reshape2::melt(kendall, varnames = c("Rule1","Rule2"), value.name = "tau")
+      })
+      hm <- ggplot2::ggplot(dfc, ggplot2::aes(Rule1, Rule2, fill = tau)) +
+        ggplot2::geom_tile(color = "white") +
+        ggplot2::geom_text(ggplot2::aes(label = sprintf("%.2f", tau))) +
+        ggplot2::scale_fill_gradientn(colours = RColorBrewer::brewer.pal(5, "BrBG"),
+                                      limits = c(-1, 1)) +
+        ggplot2::labs(title = "Kendall Rank Correlation (rules vs. rules)",
+                      x = NULL, y = NULL, fill = "τ") +
+        ggplot2::theme_minimal() +
+        ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
+      print(hm)
+    }
+
+    return(invisible(list(rank_table = rank_mat,
+                          kendall     = kendall,
+                          spearman    = spearman)))
+  }
+
+  invisible(NULL)
+}
+```
+
+### Helpers to analyze any country/year
+
+```{r}
+# Detect which E5018 letters exist for a country/year (A..I)
+detect_e5018_letters <- function(country, year) {
+  df <- subset(cses5, E1006_NAM == country & E1008 == year)
+  letters <- LETTERS[1:9]
+  evars <- paste0("E5018_", letters)
+  have <- vapply(evars, function(v) {
+    any(!is.na(df[[v]]))
+  }, logical(1))
+  letters[have]
+}
+
+# Voters on [0,1]
+get_empirical_voters01 <- function(country, year) {
+  v <- subset(cses5, E1006_NAM == country & E1008 == year)$E3020
+  v <- v[!is.na(v) & v >= 0 & v <= 10] / 10
+  if (!length(v)) stop("No valid E3020 for ", country, " ", year, ".")
+  v
+}
+
+
+# ---- scoring helpers ----
+score_by_distance <- function(dist_mat, breaks, scores = 10:0) {
+  flat <- as.numeric(as.character(cut(
+    as.vector(dist_mat),
+    breaks = breaks, labels = scores,
+    right = FALSE, include.lowest = TRUE
+  )))
+  matrix(flat, nrow = nrow(dist_mat), ncol = ncol(dist_mat), byrow = FALSE)
+}
+
+generate_score_matrix_empirical <- function(voter_positions01, alt_positions01,
+                                            breaks = c(0, 0.05, seq(0.15, 0.95, by = 0.10), 1.0)) {
+  dist_mat <- abs(outer(voter_positions01, alt_positions01, "-"))
+  scores   <- score_by_distance(dist_mat, breaks, scores = 10:0)
+  colnames(scores) <- paste0("Alt", seq_along(alt_positions01))
+  scores
+}
+
+# ---- palette helper ----
+make_party_palette <- function(names_vec) {
+  k <- length(names_vec)
+  base <- RColorBrewer::brewer.pal(8, "Set2")
+  cols <- grDevices::colorRampPalette(base)(k)
+  stats::setNames(cols, names_vec)
+}
+
+# Map E5000_* codes to names using a provided dictionary (named char)
+party_names_from_dict <- function(country, year, letters, dict_named_char) {
+  df <- subset(cses5, E1006_NAM == country & E1008 == year)
+  out <- character(length(letters)); names(out) <- letters
+
+  for (i in seq_along(letters)) {
+    v <- paste0("E5000_", letters[i])
+    if (!v %in% names(df)) { out[i] <- paste("Party", letters[i]); next }
+    code <- suppressWarnings(na.omit(df[[v]]))[1]
+    key  <- if (length(code)) sprintf("%06d", as.integer(code)) else NA_character_
+
+    out[i] <- if (!is.na(key) && key %in% names(dict_named_char)) {
+      dict_named_char[[key]]
+    } else if (!is.na(key)) {
+      paste0("Party code ", key, " (", letters[i], ")")  # fallback if dict lacks this code
+    } else {
+      paste("Party", letters[i])
+    }
+  }
+  out
+}
+
+get_party_positions_auto <- function(country, year, letters = NULL,
+                                     party_names = NULL, dict = NULL) {
+  # auto-detect letters if not supplied
+  if (is.null(letters)) {
+    df0 <- subset(cses5, E1006_NAM == country & E1008 == year)
+    letters_all <- LETTERS[1:12]
+    have <- sapply(paste0("E5018_", letters_all),
+                   function(v) v %in% names(df0) && any(!is.na(df0[[v]])))
+    letters <- letters_all[have]
+  }
+  if (!length(letters)) stop("No E5018_* party positions for ", country, " ", year, ".")
+
+  # choose names: prefer dict when provided; else keep given names; else generic
+  if (is.null(party_names)) {
+    if (!is.null(dict) && length(dict)) {
+      party_names <- party_names_from_dict(country, year, letters, dict)
+    } else {
+      party_names <- paste("Party", letters)
+    }
+  }
+
+  # pull expert L–R scores (first non-missing per letter)
+  df <- subset(cses5, E1006_NAM == country & E1008 == year)
+  ev <- df |>
+    dplyr::summarise(dplyr::across(all_of(paste0("E5018_", letters)),
+                  ~ suppressWarnings(na.omit(.))[1])) |>
+    tidyr::pivot_longer(dplyr::everything(), names_to = "var", values_to = "score_0_10") |>
+    dplyr::mutate(letter = sub("E5018_", "", var)) |>
+    dplyr::select(letter, score_0_10)
+
+  out <- dplyr::left_join(
+    data.frame(letter = letters, party = party_names, stringsAsFactors = FALSE),
+    ev, by = "letter"
+  ) |>
+    dplyr::filter(!is.na(score_0_10)) |>
+    dplyr::mutate(pos01 = pmin(pmax(score_0_10/10, 0), 1))
+
+  list(positions = out$pos01, names = out$party)
+}
+```
+
+### Full knowledge voters - Sorter
+
+```{r}
+make_full_knowledge_panel <- function(country, year, silent = FALSE) {
+  # --- helpers ---
+  valid01 <- function(x) as.numeric(ifelse(!is.na(x) & x >= 0 & x <= 10, x, NA_real_))
+  LTRS <- LETTERS[1:9]
+
+  # 1) slice election
+  df <- subset(cses5, E1006_NAM == country & E1008 == year)
+  if (nrow(df) == 0) stop("No rows for ", country, " ", year, ".")
+
+  # 2) determine available party letters
+  has_id <- LTRS[sapply(LTRS, function(L) {
+    v <- paste0("E5000_", L)
+    v %in% names(df) && any(!is.na(df[[v]]) & df[[v]] != 999999)
+  })]
+  has_like <- LTRS[sapply(LTRS, function(L) {
+    v <- paste0("E3017_", L)
+    v %in% names(df) && any(!is.na(valid01(df[[v]])))
+  })]
+  has_perc <- LTRS[sapply(LTRS, function(L) {
+    v <- paste0("E3019_", L)
+    v %in% names(df) && any(!is.na(valid01(df[[v]])))
+  })]
+  letters_avail <- Reduce(intersect, list(has_id, has_like, has_perc))
+  if (!length(letters_avail)) stop("No parties with usable E5000_, E3017_, E3019_ in ", country, " ", year, ".")
+
+  # 3) full-knowledge respondents (valid like AND perceived for every party)
+  like_mat <- sapply(letters_avail, function(L) valid01(df[[paste0("E3017_", L)]]))
+  perc_mat <- sapply(letters_avail, function(L) valid01(df[[paste0("E3019_", L)]]))
+  like_mat <- as.data.frame(like_mat)
+  perc_mat <- as.data.frame(perc_mat)
+
+  full_knowledge <- apply(like_mat, 1, function(row) all(!is.na(row))) &
+                    apply(perc_mat, 1, function(row) all(!is.na(row)))
+
+  n_total <- nrow(df)
+  n_full  <- sum(full_knowledge, na.rm = TRUE)
+
+  if (n_full == 0) {
+    msg <- paste0(
+      "Total individuals: ", n_total,
+      "\nFull-knowledge:  ", n_full, "\n"
+    )
+    message("Found 0 full-knowledge respondents for ", country, " ", year, ".")
+    return(list(
+      n_total = n_total, n_full = n_full, n_self = 0,
+      info = msg, letters_available = letters_avail,
+      panel = tibble::tibble()
+    ))
+  }
+
+  # 4) Keep only full-knowledge respondents
+  df_full <- df[full_knowledge, , drop = FALSE] |>
+    dplyr::mutate(
+      respondent_id = E1005,
+      self_lr_0_10  = valid01(E3020),
+      .rid = dplyr::row_number()
+    )
+
+  # Identify those with valid self-placement
+  self_ok <- !is.na(df_full$self_lr_0_10)
+  n_self  <- sum(self_ok)
+
+  # helper to long-pivot a party-stub block and keep only letters_avail
+  pivot_block <- function(dat, stub, value_name) {
+    cols <- paste0(stub, "_", letters_avail)
+    cols <- cols[cols %in% names(dat)]
+    dat |>
+      dplyr::select(.rid, dplyr::all_of(cols)) |>
+      tidyr::pivot_longer(-.rid,
+                          names_to = "party_letter",
+                          values_to = value_name) |>
+      dplyr::mutate(party_letter = sub(paste0("^", stub, "_"), "", party_letter))
+  }
+
+  # 5) build long blocks
+  long_id   <- pivot_block(df_full, "E5000", "party_id_numeric")
+  long_like <- pivot_block(df_full, "E3017", "like_0_10")   |> dplyr::mutate(like_0_10   = valid01(like_0_10))
+  long_exp  <- pivot_block(df_full, "E5018", "expert_lr_0_10") |> dplyr::mutate(expert_lr_0_10 = valid01(expert_lr_0_10))
+  long_perc <- pivot_block(df_full, "E3019", "perceived_lr_0_10") |> dplyr::mutate(perceived_lr_0_10 = valid01(perceived_lr_0_10))
+
+  # keep only declared available parties
+  long_id   <- dplyr::filter(long_id,   party_letter %in% letters_avail)
+  long_like <- dplyr::filter(long_like, party_letter %in% letters_avail)
+  long_exp  <- dplyr::filter(long_exp,  party_letter %in% letters_avail)
+  long_perc <- dplyr::filter(long_perc, party_letter %in% letters_avail)
+
+  # 6) compute avg perceived LR among ALL full-knowledge voters (per party)
+  avg_perceived <- long_perc |>
+    dplyr::group_by(party_letter) |>
+    dplyr::summarise(avg_perceived_lr = mean(perceived_lr_0_10, na.rm = TRUE), .groups = "drop")
+
+  # 7) join blocks + respondent attributes
+  panel_full <- long_id |>
+    dplyr::left_join(long_like, by = c(".rid", "party_letter")) |>
+    dplyr::left_join(long_exp,  by = c(".rid", "party_letter")) |>
+    dplyr::left_join(long_perc, by = c(".rid", "party_letter")) |>
+    dplyr::left_join(df_full |> dplyr::select(.rid, respondent_id, self_lr_0_10),
+                     by = ".rid") |>
+    dplyr::left_join(avg_perceived, by = "party_letter") |>
+    dplyr::mutate(
+      country = country, year = year,
+      dist_self_expert  = abs(self_lr_0_10 - expert_lr_0_10),
+      dist_self_avgperc = abs(self_lr_0_10 - avg_perceived_lr)
+    ) |>
+    dplyr::select(country, year, respondent_id, party_letter, party_id_numeric,
+                  like_0_10, self_lr_0_10, expert_lr_0_10, perceived_lr_0_10,
+                  avg_perceived_lr, dist_self_expert, dist_self_avgperc)
+
+  # 8) restrict to those with valid self-placement
+  panel <- panel_full |>
+    dplyr::semi_join(
+      df_full |>
+        dplyr::filter(self_ok) |>
+        dplyr::select(.rid, respondent_id),
+      by = "respondent_id"
+    )
+
+  # info string
+  inf_loss <- ((n_total - n_self) / n_total) * 100
+  l <- list(letters_avail)
+  msg <- paste0("======================================\n",
+    "---------- ", country, " (", year, ")", " ----------\n",
+    "======================================\n",
+    "- Total individuals: ", n_total,
+    "\n- Full-knowledge (likes + perceived):  ", n_full,
+    "\n- With self-placement (subset of full-knowledge): ", n_self,
+    "\n- Percentage of indivs lost: ", round(inf_loss, 2), "%\n",
+    "- Number of parties: ", length(letters_avail), ", Parties: " , l,
+    "\n======================================\n"
+  )
+
+  list(
+    info = if (!silent) cat(msg),
+    letters_available = letters_avail,
+    panel = panel
+  )
+}
+```
+
+
+
+### Run country
+
+```{r}
+run_country <- function(country, year,
+                        breaks         = c(0, 0.05, seq(0.15, 0.95, by = 0.10), 1.0),
+                        dict           = NULL,
+                        rules          = c("borda","plurality","approval2","mean_winner"),
+                        scheme_params  = list(),
+                        full_knowledge = FALSE,
+                        silent         = FALSE,   # suppress cat() banners
+                        plot           = TRUE,    # show voter+party plot?
+                        quiet          = FALSE) { # pass through to analyze_synthetic plots
+
+  # ---- header (respect silent) ----
+  if (!silent) cat("\n==== ", country, " ", year, " ====\n", sep = "")
+
+  # ---- voters + alternatives ----
+  if (full_knowledge) {
+    fk <- make_full_knowledge_panel(country, year, silent = silent)
+    panel <- fk$panel
+    if (nrow(panel) == 0) stop("No full-knowledge respondents available for ", country, " ", year)
+
+    voters01 <- unique(panel[, c("respondent_id", "self_lr_0_10")])$self_lr_0_10 / 10
+
+    # robust party positions + names via dict (ID-safe, dedup)
+    .mode_val <- function(x) { y <- x[!is.na(x)]; if (!length(y)) return(NA); names(sort(table(y), TRUE))[1] }
+    .to_id6   <- function(x) ifelse(grepl("^\\d+$", x), sprintf("%06d", as.integer(x)), x)
+
+    alts_df <- panel |>
+      dplyr::group_by(party_letter) |>
+      dplyr::summarise(
+        pos        = mean(expert_lr_0_10, na.rm = TRUE),
+        party_id_m = .mode_val(as.character(party_id_numeric)),
+        .groups = "drop"
+      ) |>
+      dplyr::mutate(party_id6 = .to_id6(party_id_m))
+
+    alts    <- alts_df$pos / 10
+    letters <- alts_df$party_letter
+
+    if (!is.null(dict)) {
+      nms <- unname(dict[alts_df$party_id6])
+      miss <- is.na(nms) | nms == ""
+      if (any(miss)) nms[miss] <- unname(dict[alts_df$party_id_m[miss]])
+      nms[is.na(nms) | nms == ""] <- letters[is.na(nms) | nms == ""]
+    } else {
+      nms <- letters
+    }
+    if (anyDuplicated(nms)) nms <- make.unique(nms, sep = " ")
+  } else {
+    voters01 <- get_empirical_voters01(country, year)
+    if (!silent) cat("Valid voters (E3020 in [0,10]): ", length(voters01), "\n", sep = "")
+    pp   <- get_party_positions_auto(country, year, dict = dict)
+    alts <- pp$positions
+    nms  <- pp$names
+  }
+
+  pal <- make_party_palette(nms)
+
+  # ---- optional plot ----
+  if (plot && !quiet) {
+    letters_auto <- if (full_knowledge) letters else detect_e5018_letters(country, year)
+    suppressWarnings(print(
+      plot_voters_and_parties(country, year, letters_auto, nms, pal, title_prefix = country)
+    ))
+  }
+
+  # ---- utilities matrix ----
+  vmat <- generate_score_matrix_empirical(
+    voter_positions01 = voters01,
+    alt_positions01   = alts,
+    breaks            = breaks
+  )
+  colnames(vmat) <- nms
+
+  # ---- analyze + explicit return (forward quiet) ----
+  return(
+    analyze_synthetic(vmat,
+                      rules         = rules,
+                      scheme_params = scheme_params,
+                      scaled        = TRUE,
+                      ordered       = TRUE,
+                      w             = 0.2,
+                      palette       = pal,
+                      quiet         = quiet)
+  )
+}
+```
+
+
+
+# Single Country Evaluation
+
+## Simple
+```{r}
+run_country("Denmark", 2019, breaks = breaks_linear, dict = Denmark_2019_dict, 
+            full_knowledge = TRUE, silent = FALSE)
+```
+
+## Extensive
+```{r}
+rules <- c(
+  "borda","plurality","approval2","mean_winner",
+  "copeland","ostracism", "ostracism_3", "ostr_gen_borda", "general_borda","multiple_votes",
+  "dictator_r", "random_r", "majority_r", "irv_r", "condorcet_r", "typical_judgment_r", "majority_judgment_r"
+  #"dictator","random", "majority", "two_round", "irv", "condorcet", "typical_judgment", "majority_judgment"
+)
+
+scheme_params <- list(
+  general_borda  = list(q = 5),
+  multiple_votes = list(g = 5)
+  #dictator       = list(dictator = 1)
+)
+
+run_country("Denmark", 2019,
+            breaks = breaks_linear,
+            dict = Denmark_2019_dict,
+            rules = rules,
+            scheme_params = scheme_params)
+```
+
+
+
+
+
+
+# Multiple runs
+
+## Code
+```{r}
+average_kendall <- function(country, year, n = 3, seed = NULL, verbose = FALSE, ...) {
+  if (!is.null(seed)) set.seed(seed)
+
+  sum_mat <- NULL
+  used <- 0L
+
+  for (i in seq_len(n)) {
+    if (verbose) message("Replication ", i, " of ", n, " …")
+    # Run silently; only the return value matters
+    res <- try(run_country(country, year, quiet = TRUE, ...), silent = TRUE)
+    if (inherits(res, "try-error") || is.null(res$kendall)) next
+
+    K <- res$kendall
+    if (is.null(sum_mat)) {
+      sum_mat <- K
+    } else {
+      rn <- intersect(rownames(sum_mat), rownames(K))
+      cn <- intersect(colnames(sum_mat), colnames(K))
+      if (length(rn) == 0 || length(cn) == 0) next
+      if (!identical(rn, rownames(sum_mat)) || !identical(cn, colnames(sum_mat))) {
+        sum_mat <- sum_mat[rn, cn, drop = FALSE]
+      }
+      K <- K[rownames(sum_mat), colnames(sum_mat), drop = FALSE]
+      sum_mat <- sum_mat + K
+    }
+    used <- used + 1L
+  }
+
+  if (used == 0L) stop("All replications failed or returned no Kendall matrix.")
+
+  list(
+    kendall_avg = sum_mat / used,
+    replications = used,
+    country = country,
+    year = year
+  )
+}
+```
+
+```{r}
+plot_avg_kendall <- function(kendall_avg,
+                             title = "Kendall Rank Correlation (averaged)",
+                             base_size = 10,
+                             label_size = 3,
+                             rotate_x = 35,
+                             square_tiles = FALSE,   # <- new
+                             tile_ratio = 0.6) {     # <- used if square_tiles=TRUE but elongated
+
+  df <- as.data.frame(as.table(kendall_avg))
+  names(df) <- c("Rule1","Rule2","tau")
+  df$Rule1 <- factor(df$Rule1, levels = rownames(kendall_avg))
+  df$Rule2 <- factor(df$Rule2, levels = colnames(kendall_avg))
+
+  p <- ggplot2::ggplot(df, ggplot2::aes(Rule2, Rule1, fill = tau)) +
+    
+    ggplot2::geom_tile(color = "white") +
+    ggplot2::geom_text(ggplot2::aes(label = sprintf("%.2f", tau)), size = label_size) +
+    ggplot2::scale_fill_gradientn(
+      colours =c("#8c510a", "#f7f7f7", "#006837"),
+      limits  = c(-1, 1),
+      values  = scales::rescale(c(-1, -0.5, 0, 0.5, 1))
+    ) +
+    ggplot2::labs(title = title, x = NULL, y = NULL, fill = expression(tau)) +
+    ggplot2::theme_minimal(base_size = base_size) +
+    ggplot2::theme(
+      axis.text.x = ggplot2::element_text(angle = rotate_x, hjust = 1),
+      panel.grid  = ggplot2::element_blank(),
+      plot.margin = ggplot2::margin(10, 16, 10, 10)
+    )
+
+  if (square_tiles) {
+    # ratio < 1 stretches horizontally; try 0.6–0.8
+    p <- p + ggplot2::coord_fixed(ratio = tile_ratio)
+  }
+  p
+}
+```
+
+```{r}
+# --- helper: run any expression with all output, messages & warnings suppressed ---
+.quietly <- function(expr) {
+  tf <- tempfile(fileext = ".png")
+  grDevices::png(tf)                                   # divert any plots here
+  on.exit({ try(grDevices::dev.off(), silent = TRUE); unlink(tf) }, add = TRUE)
+
+  val <- NULL
+  withCallingHandlers(
+    {
+      suppressWarnings(                                # silence warnings within block
+        utils::capture.output(                         # swallow cat()/print()
+          { val <- eval.parent(substitute(expr)) },
+          type = "output"
+        )
+      )
+    },
+    message = function(m) invokeRestart("muffleMessage"),  # silence message()
+    warning = function(w) invokeRestart("muffleWarning")   # silence warning()
+  )
+  val                                                     # return original value
+}
+
+average_kendall <- function(country, year, n = 3, seed = NULL,
+                            verbose = FALSE, progress = TRUE, ...) {
+  if (!is.null(seed)) set.seed(seed)
+  sum_mat <- NULL; used <- 0L
+  for (i in seq_len(n)) {
+    if (progress) cat(sprintf("running %d of %d\n", i, n))
+    if (verbose)  message("Replication ", i, " of ", n, " …")
+
+    res <- try(.quietly(run_country(country, year, quiet = TRUE, ...)), silent = TRUE)
+    if (inherits(res, "try-error") || is.null(res$kendall)) next
+
+    K <- res$kendall
+    if (is.null(sum_mat)) sum_mat <- K else {
+      rn <- intersect(rownames(sum_mat), rownames(K))
+      cn <- intersect(colnames(sum_mat), colnames(K))
+      if (length(rn) == 0 || length(cn) == 0) next
+      if (!identical(rn, rownames(sum_mat)) || !identical(cn, colnames(sum_mat)))
+        sum_mat <- sum_mat[rn, cn, drop = FALSE]
+      K <- K[rownames(sum_mat), colnames(sum_mat), drop = FALSE]
+      sum_mat <- sum_mat + K
+    }
+    used <- used + 1L
+  }
+  if (used == 0L) stop("All replications failed or returned no Kendall matrix.")
+  list(kendall_avg = sum_mat / used, replications = used,
+       country = country, year = year)
+}
+```
+
+```{r}
+# Convenience: run + immediately plot
+kendall_replicated_heatmap <- function(country, year, n = 3, seed = NULL, ...) {
+  avg <- average_kendall(country, year, n = n, seed = seed, ...)
+  p <- plot_avg_kendall(avg$kendall_avg,
+                        title = paste0("Kendall Rank Correlation (averaged over ",
+                                       avg$replications, " runs)"))
+  print(p)                 # ensure it renders during knit/inside functions
+  invisible(list(plot = p, average = avg))
+}
+```
+
+
+
+## Evaluation
+```{r}
+rules <- c(
+  "borda",             # full ranking from every voter (uses complete preference info)
+  "general_borda_5",   # top-5 partial rankings
+  "general_borda_3",   # top-3 partial rankings
+  "mean_winner",       # uses full cardinal utilities (average), but ignores order relations
+  "copeland",          # pairwise comparisons between all candidates
+  "multiple_votes_5",  # each voter selects top 5
+  "multiple_votes_3",  # each voter selects top 3
+  "approval",          # each voter approves above mean
+  "approval2",         # each voter approves above 5
+  "ostr_gen_borda",    # +3,+2,+1 to top 3; -3,-2,-1 to bottom 3
+  "ostracism_3",       # +1 to top 3, -1 to bottom 3
+  "ostracism",         # top + bottom choice (+1/-1)
+  "plurality",         # only top choice from each voter
+  "dictator_r",        # only one voter’s preferences used
+  "random_r"           # no voter information at all (pure random ranking)
+)
+```
+
+```{r}
+kendall_replicated_heatmap("Netherlands", 2017, n = 10,
+                           breaks = breaks_linear,
+                           dict = Netherlands_2017_dict,
+                           rules = rules,
+                           scheme_params = scheme_params,
+                           full_knowledge = TRUE)
+```
+
+
+```{r}
+kendall_replicated_heatmap("Denmark", 2019, n = 25,
+                           breaks = breaks_linear,
+                           dict = Denmark_2019_dict,
+                           rules = rules,
+                           scheme_params = scheme_params,
+                           full_knowledge = TRUE)
+```
+
+```{r}
+kendall_replicated_heatmap("Czechia", 2017, n = 25,
+                           breaks = breaks_linear,
+                           dict = Denmark_2019_dict,
+                           rules = rules,
+                           scheme_params = scheme_params,
+                           full_knowledge = TRUE)
+```
+
+
+```{r}
+kendall_replicated_heatmap("Czechia", 2021, n = 25,
+                           breaks = breaks_linear,
+                           dict = Denmark_2019_dict,
+                           rules = rules,
+                           scheme_params = scheme_params,
+                           full_knowledge = TRUE)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Cluster analysis
+## Code
+```{r}
+# ============ A) From averaged Kendall: MDS + dendrogram ============
+# Input: a list returned by kendall_replicated_heatmap(...), or directly the matrix
+viz_from_kendall <- function(kendall_avg,
+                             title_map = "Rules: MDS from Kendall τ",
+                             title_dend = "Rules: Hierarchical clustering (from τ)",
+                             k_mds = 2,  # dimensions to show
+                             linkage = "average") {
+  stopifnot(is.matrix(kendall_avg), nrow(kendall_avg) == ncol(kendall_avg))
+  rules <- rownames(kendall_avg)
+
+  # Distance from Kendall (metric-friendly)
+  D <- (1 - kendall_avg) / 2
+  diag(D) <- 0
+  D <- as.dist(D)
+
+  # --- MDS (classical) ---
+  mds <- cmdscale(D, k = k_mds, eig = TRUE)
+  pts <- as.data.frame(mds$points)
+  colnames(pts) <- paste0("Dim", 1:k_mds)
+  pts$Rule <- rules
+
+  p_mds <- ggplot(pts, aes(Dim1, Dim2, label = Rule)) +
+    geom_point() +
+    ggrepel::geom_text_repel(size = 3.3, max.overlaps = Inf) +
+    labs(title = title_map,
+         subtitle = sprintf("Explained (Dim1+Dim2) ~ %.1f%%",
+                            100 * sum(mds$eig[1:2]) / sum(pmax(mds$eig, 0), na.rm = TRUE)),
+         x = "MDS 1", y = "MDS 2") +
+    theme_minimal()
+
+  print(p_mds)
+
+  # --- Dendrogram ---
+  hc <- hclust(D, method = linkage)
+  plot(hc, main = title_dend, xlab = "", sub = sprintf("Linkage: %s", linkage))
+
+  invisible(list(mds_plot = p_mds, hclust = hc, distances = D))
+}
+
+# Example (after you computed avg via kendall_replicated_heatmap):
+# res <- kendall_replicated_heatmap("Denmark", 2019, n = 25, breaks = breaks_linear,
+#                                   dict = Denmark_2019_dict, rules = rules,
+#                                   scheme_params = scheme_params, full_knowledge = TRUE)
+# viz_from_kendall(res$average$kendall_avg)
+
+# ============ B) PCA from full rank information across runs ============
+# We stack rank tables over many silent runs to build features = (alt × run).
+collect_rank_features <- function(country, year, n = 20, seed = NULL,
+                                  ..., progress = TRUE,
+                                  .require_min_rules = 2) {
+  if (!is.null(seed)) set.seed(seed)
+  rule_names <- NULL
+  feat_list  <- list()
+
+  for (i in seq_len(n)) {
+    if (progress) cat(sprintf("running %d of %d\n", i, n))
+
+    # fully silent run (like kendall_replicated_heatmap)
+    res <- try(.quietly(run_country(country, year, quiet = TRUE, ...)), silent = TRUE)
+    if (inherits(res, "try-error") || is.null(res$rank_table)) next
+
+    R <- res$rank_table  # rows = alternatives, cols = rules
+
+    # maintain consistent rule set across runs
+    if (is.null(rule_names)) {
+      rule_names <- colnames(R)
+    } else {
+      common <- intersect(rule_names, colnames(R))
+      if (length(common) < .require_min_rules) next
+
+      if (!identical(common, rule_names)) {
+        rule_names <- common
+        if (length(feat_list)) {
+          feat_list <- lapply(feat_list, function(M) M[rule_names, , drop = FALSE])
+        }
+      }
+      R <- R[, rule_names, drop = FALSE]
+    }
+
+    # transpose: rows = rules, cols = (alts × this run)
+    feat_list[[length(feat_list) + 1]] <- t(R)
+  }
+
+  if (!length(feat_list)) stop("No usable rank tables collected.")
+  X <- do.call(cbind, feat_list)        # rows = rules, cols = alt × run
+  attr(X, "rule_names") <- rownames(X)
+  X
+}
+
+pca_on_ranks <- function(X, title = "PCA of rules from stacked alternative ranks") {
+  # Rows = rules (observations), columns = features (alt × run ranks)
+  # Center & scale features to remove arbitrary level/variance differences.
+  p <- prcomp(X, center = TRUE, scale. = TRUE)
+  scores <- as.data.frame(p$x[, 1:2])
+  scores$Rule <- rownames(scores)
+
+  var_expl <- 100 * (p$sdev[1:2]^2) / sum(p$sdev^2)
+
+  gp <- ggplot(scores, aes(PC1, PC2, label = Rule)) +
+    geom_point() +
+    ggrepel::geom_text_repel(size = 3.2, max.overlaps = Inf) +
+    labs(
+      title = title,
+      subtitle = sprintf("Explained variance: PC1 %.1f%%, PC2 %.1f%%",
+                         var_expl[1], var_expl[2])
+    ) +
+    theme_minimal()
+  print(gp)
+
+  invisible(list(pca = p, plot = gp))
+}
+```
+
+
+## Evaluation
+```{r}
+set.seed(9)
+Collected_features <- collect_rank_features("Netherlands", 2017, n = 25,
+                            breaks = breaks_linear, dict = Netherlands_2017_dict,
+                            rules = rules, scheme_params = scheme_params,
+                            full_knowledge = TRUE)
+```
+
+
+```{r}
+pca_on_ranks(Collected_features)
+```
+
+
+## Advanced
+```{r}
+# ========= Minimal metadata (no info_depth) =========
+make_rule_meta_min <- function(rule_names) {
+  rn  <- rule_names
+  rnl <- tolower(gsub("[^a-z0-9_]+", "", rn))  # normalized for matching
+  has <- function(p) grepl(p, rnl)
+
+  data.frame(
+    Rule          = rn,
+    is_random     = as.integer(has("^random")),
+    uses_pairwise = as.integer(has("copeland|condorcet")),
+    uses_cardinal = as.integer(has("meanwinner|judgment")),
+    uses_bottom   = as.integer(has("ostr|negativevoting")),
+    row.names     = rn,
+    stringsAsFactors = FALSE
+  )
+}
+
+# ========= PCA scatter with optional clustering (no arrows) =========
+annotate_pca_clusters <- function(pca_obj, rule_meta,
+                                  cluster_k = NULL,
+                                  title = "Voting Rules: PCA (clusters, no arrows)") {
+  stopifnot(inherits(pca_obj, "prcomp"))
+  scores <- as.data.frame(pca_obj$x[, 1:2, drop = FALSE])
+  scores$Rule <- rownames(pca_obj$x)
+
+  # ensure metadata rows match plotted rules
+  stopifnot(all(scores$Rule %in% rownames(rule_meta)))
+  M <- rule_meta[scores$Rule, , drop = FALSE]  # kept for your downstream summaries if needed
+
+  # optional k-means clustering in PC space
+  if (!is.null(cluster_k) && cluster_k > 1) {
+    set.seed(42)
+    km <- kmeans(scores[, c("PC1","PC2")], centers = cluster_k, nstart = 25)
+    scores$Cluster <- factor(km$cluster)
+  }
+
+  # explained variance labels
+  var_pct <- 100 * (pca_obj$sdev^2) / sum(pca_obj$sdev^2)
+  sub_txt <- sprintf("PC1 %.1f%%, PC2 %.1f%%", var_pct[1], var_pct[2])
+
+  # plot (no arrows; strong label repulsion; clean cluster legend)
+  p <- ggplot2::ggplot(scores, ggplot2::aes(PC1, PC2)) +
+    {
+      if ("Cluster" %in% names(scores)) {
+        ggplot2::geom_point(ggplot2::aes(color = Cluster), size = 2.8)
+      } else {
+        ggplot2::geom_point(color = "black", size = 2.8)
+      }
+    } +
+    ggrepel::geom_text_repel(
+      ggplot2::aes(label = Rule),
+      size = 3.4,
+      max.overlaps = Inf,
+      box.padding = 0.8,
+      point.padding = 0.4,
+      force = 5,
+      segment.size = 0.3,
+      segment.alpha = 0.5
+    ) +
+    ggplot2::labs(title = title, subtitle = sub_txt,
+                  color = if ("Cluster" %in% names(scores)) "Cluster" else NULL) +
+    ggplot2::theme_minimal()
+
+  print(p)
+  invisible(list(plot = p, scores = scores, meta = M))
+}
+
+# ========= Convenience wrapper for your X =========
+pca_on_ranks_clusters <- function(X, rule_meta = NULL, cluster_k = 3,
+                                  title = "Voting Rules: PCA (clusters, no arrows)") {
+  # PCA on rows = rules, cols = features (alt × run)
+  p <- stats::prcomp(X, center = TRUE, scale. = TRUE)
+  if (is.null(rule_meta)) rule_meta <- make_rule_meta_min(rownames(X))
+  annotate_pca_clusters(p, rule_meta, cluster_k = cluster_k, title = title)
+}
+```
+
+
+```{r}
+# Pretty labels exactly as they appear in rownames(X)
+pretty_rules <- c(
+  "Borda",
+  "Gen. Borda (top 5)",
+  "Gen. Borda (top 3)",
+  "Mean Utility",
+  "Copeland",
+  "k-Approval (top 5)",
+  "k-Approval (top 3)",
+  "Approval (≥ mean)",
+  "Approval (≥ 5)",
+  "Ostra-Borda (±3..±1)",
+  "Ostracism (↑3, ↓3)",
+  "Ostracism (+1/-1)",
+  "Plurality",
+  "Dictator (ranked)",
+  "Random (ranked)"
+)
+
+rule_meta_pretty <- data.frame(
+  Rule = pretty_rules,
+  # heuristic “information depth” scale: 0 (random) … 10 (full info)
+  info_depth = c(
+    10, 5, 3, 10,   # Borda, Gen5, Gen3, Mean Utility
+    10, 5, 3, 5, 5, # Copeland, k-App5, k-App3, mean-thresh, fixed-5
+    6, 6, 2, 1, 1, 0  # Ostra-Borda, Ostr 3/3, Ostr +1/-1, Plurality, Dictator, Random
+  ),
+  is_random = c(
+    0,0,0,0,
+    0,0,0,0,0,
+    0,0,0,0,0,1
+  ),
+  uses_pairwise = c(
+    0,0,0,0,
+    1,0,0,0,0,
+    0,0,0,0,0,0
+  ),
+  uses_cardinal = c(
+    0,0,0,1,  # Mean Utility is cardinal
+    0,0,0,0,0,
+    0,0,0,0,0,0
+  ),
+  uses_bottom = c(
+    0,0,0,0,
+    0,0,0,0,0,
+    1,1,1,0,0,0
+  ),
+  stringsAsFactors = FALSE
+)
+rownames(rule_meta_pretty) <- rule_meta_pretty$Rule
+
+name_map <- c(
+  "borda"="Borda",
+  "general_borda_5"="Gen. Borda (top 5)",
+  "general_borda_3"="Gen. Borda (top 3)",
+  "mean_winner"="Mean Utility",
+  "copeland"="Copeland",
+  "multiple_votes_5"="k-Approval (top 5)",
+  "multiple_votes_3"="k-Approval (top 3)",
+  "approval"="Approval (≥ mean)",
+  "approval2"="Approval (≥ 5)",
+  "ostr_gen_borda"="Ostra-Borda (±3..±1)",
+  "ostracism_3"="Ostracism (↑3, ↓3)",
+  "ostracism"="Ostracism (+1/-1)",
+  "plurality"="Plurality",
+  "dictator_r"="Dictator (ranked)",
+  "random_r"="Random (ranked)"
+)
+
+# If your metadata is defined on raw names, re-key to pretty:
+rekey_meta_to_pretty <- function(meta_raw, name_map) {
+  keep <- intersect(names(name_map), rownames(meta_raw))
+  meta_pretty <- meta_raw[keep, , drop = FALSE]
+  rownames(meta_prety) <- name_map[keep]
+  meta_pretty
+}
+```
+
+
+```{r}
+set.seed(9)
+out <- pca_on_ranks_clusters(Collected_features,
+  cluster_k = 4,
+  title = "Voting Rules: PCA (clusters only)"
+)
+```
+```{r}
+aggregate(rule_meta_pretty[, c("info_depth", "uses_pairwise", "uses_cardinal", "uses_bottom", "is_random")],
+          by = list(Cluster = out$scores$Cluster),
+          FUN = mean, na.rm = TRUE)
+```
+
+```{r}
+cluster_labels <- c(
+  "1" = "Low Information",
+  "2" = "Minimum Information",
+  "3" = "No Information (Random)",
+  "4" = "Information-rich"
+)
+out$scores$ClusterLabel <- cluster_labels[out$scores$Cluster]
+
+ggplot(out$scores, aes(PC1, PC2, color = ClusterLabel, label = Rule)) +
+  geom_point(size = 3) +
+      ggrepel::geom_text_repel(
+      ggplot2::aes(label = Rule),
+      size = 3.4,
+      max.overlaps = Inf,
+      box.padding = 0.8,
+      point.padding = 0.4,
+      force = 5,
+      segment.size = 0.3,
+      segment.alpha = 0.5
+    ) +
+  scale_color_brewer(palette = "Set1") +
+  theme_minimal() +
+  labs(color = "Cluster Type")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+set.seed(73)
+pca_on_ranks_clusters(collect_rank_features("France", 2017, n = 25,
+                            breaks = breaks_linear, dict = France_2017_dict,
+                            rules = rules, scheme_params = scheme_params,
+                            full_knowledge = TRUE), cluster_k = 4,
+                            title = "Voting Rules: PCA (clusters only)"
+)
+```
+```{r}
+set.seed(73)
+pca_on_ranks_clusters(collect_rank_features("France", 2017, n = 25,
+                            breaks = breaks_sigmo, dict = France_2017_dict,
+                            rules = rules, scheme_params = scheme_params,
+                            full_knowledge = TRUE), cluster_k = 4,
+                            title = "Voting Rules: PCA (clusters only)"
+)
+```
+
+```{r}
+set.seed(73)
+pca_on_ranks_clusters(collect_rank_features("Czechia", 2017, n = 25,
+                            breaks = breaks_linear, dict = Czechia_2017_dict,
+                            rules = rules, scheme_params = scheme_params,
+                            full_knowledge = TRUE), cluster_k = 4,
+                            title = "Voting Rules: PCA (clusters only)"
+)
+```
+```{r}
+set.seed(73)
+pca_on_ranks_clusters(collect_rank_features("Czechia", 2017, n = 25,
+                            breaks = breaks_sigmo, dict = Czechia_2017_dict,
+                            rules = rules, scheme_params = scheme_params,
+                            full_knowledge = TRUE), cluster_k = 4,
+                            title = "Voting Rules: PCA (clusters only)"
+)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
